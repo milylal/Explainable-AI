@@ -1,0 +1,181 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from imblearn.over_sampling import SMOTE
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Dropout, Concatenate
+from tensorflow.keras.utils import to_categorical
+import shap
+import matplotlib.pyplot as plt
+from lime.lime_tabular import LimeTabularExplainer
+from scipy.stats import kendalltau
+
+# Load dataset
+df = pd.read_csv("/content/alzheimers_disease_data.csv")
+df = df.drop(columns=["PatientID", "DoctorInCharge"])
+
+# Impute missing values
+df.fillna(df.mean(numeric_only=True), inplace=True)
+for col in df.select_dtypes(include=['object']).columns:
+    df[col].fillna(df[col].mode()[0], inplace=True)
+
+# Encode categorical columns
+for col in df.select_dtypes(include=['object']).columns:
+    df[col] = LabelEncoder().fit_transform(df[col])
+
+# Remove outliers (example: domain-based thresholding)
+# Example threshold: drop any rows where 'Age' < 40 or > 100
+if 'Age' in df.columns:
+    df = df[(df['Age'] >= 40) & (df['Age'] <= 100)]
+
+# Define X and y
+X = df.drop("Diagnosis", axis=1)
+y = df["Diagnosis"]
+
+# Normalize features
+scaler = MinMaxScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Address class imbalance
+smote = SMOTE()
+X_res, y_res = smote.fit_resample(X_scaled, y)
+#adasyn = ADASYN()
+#X_res, y_res = adasyn.fit_resample(X_res, y_res)
+#smoteenn = SMOTEENN()
+#X_res, y_res = smoteenn.fit_resample(X_res, y_res)
+
+# Train-test split
+X_train, X_test, y_train, y_test = train_test_split(X_res, y_res, test_size=0.2, random_state=42)
+
+# Ensemble for feature engineering
+xgb = XGBClassifier()
+rf = RandomForestClassifier()
+et = ExtraTreesClassifier()
+lgbm = LGBMClassifier()
+
+# Fit each model
+xgb.fit(X_train, y_train)
+rf.fit(X_train, y_train)
+et.fit(X_train, y_train)
+lgbm.fit(X_train, y_train)
+
+# Get leaf indices
+xgb_leaves = xgb.apply(X_train)
+rf_leaves = rf.apply(X_train)
+et_leaves = et.apply(X_train)
+lgbm_leaves = lgbm.predict(X_train, pred_leaf=True)
+
+xgb_leaves_test = xgb.apply(X_test)
+rf_leaves_test = rf.apply(X_test)
+et_leaves_test = et.apply(X_test)
+lgbm_leaves_test = lgbm.predict(X_test, pred_leaf=True)
+
+# Concatenate and scale leaf outputs
+X_train_leaves = np.concatenate([xgb_leaves, rf_leaves, et_leaves, lgbm_leaves], axis=1)
+X_test_leaves = np.concatenate([xgb_leaves_test, rf_leaves_test, et_leaves_test, lgbm_leaves_test], axis=1)
+
+leaf_scaler = MinMaxScaler()
+X_train_leaves_scaled = leaf_scaler.fit_transform(X_train_leaves)
+X_test_leaves_scaled = leaf_scaler.transform(X_test_leaves)
+
+# Compute class weights
+class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
+class_weights_dict = dict(enumerate(class_weights))
+
+# Build neural network
+input_nn = Input(shape=(X_train.shape[1],), name="original_input")
+input_ensemble = Input(shape=(X_train_leaves.shape[1],), name="ensemble_input")
+
+dnn = Dense(64, activation='relu')(input_nn)
+dnn = Dropout(0.3)(dnn)
+ensemble_branch = Dense(64, activation='relu')(input_ensemble)
+ensemble_branch = Dropout(0.3)(ensemble_branch)
+
+merged = Concatenate()([dnn, ensemble_branch])
+merged = Dense(32, activation='relu')(merged)
+output = Dense(1, activation='sigmoid')(merged)
+
+model = Model(inputs=[input_nn, input_ensemble], outputs=output)
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+# Train model
+model.fit([X_train, X_train_leaves_scaled], y_train, epochs=75, batch_size=32,
+          validation_split=0.1, class_weight=class_weights_dict)
+
+# Evaluate
+loss, accuracy = model.evaluate([X_test, X_test_leaves_scaled], y_test)
+print(f"Test Accuracy: {accuracy:.4f}")
+
+# Predictions
+y_train_pred = (model.predict([X_train, X_train_leaves_scaled], verbose=0) > 0.5).astype(int)
+y_test_pred = (model.predict([X_test, X_test_leaves_scaled], verbose=0) > 0.5).astype(int)
+
+train_accuracy = accuracy_score(y_train, y_train_pred)
+test_accuracy = accuracy_score(y_test, y_test_pred)
+precision = precision_score(y_test, y_test_pred)
+recall = recall_score(y_test, y_test_pred)
+f1 = f1_score(y_test, y_test_pred)
+
+print(f"Training Accuracy: {train_accuracy:.4f}")
+print(f"Test Accuracy:     {test_accuracy:.4f}")
+print(f"Precision:         {precision:.4f}")
+print(f"Recall:            {recall:.4f}")
+print(f"F1-Score:          {f1:.4f}")
+
+# SHAP
+explainer = shap.Explainer(xgb)
+shap_values = explainer(X_test)
+shap_importance = np.abs(shap_values.values).mean(axis=0)
+shap_ranks = pd.Series(shap_importance, index=X.columns).rank(ascending=False)
+
+# LIME
+lime_explainer = LimeTabularExplainer(X_train, feature_names=X.columns,
+                                      class_names=["No AD", "AD"], mode='classification')
+
+def predict_fn_wrapper(x):
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+    xgb_leaf = xgb.apply(x)
+    rf_leaf = rf.apply(x)
+    et_leaf = et.apply(x)
+    lgbm_leaf = lgbm.predict(x, pred_leaf=True)
+    x_leaves = np.concatenate([xgb_leaf, rf_leaf, et_leaf, lgbm_leaf], axis=1)
+    x_leaves_scaled = leaf_scaler.transform(x_leaves)
+    probs = model.predict([x, x_leaves_scaled], verbose=0)
+    return np.column_stack([1 - probs[:, 0], probs[:, 0]])
+
+lime_exp = lime_explainer.explain_instance(X_test[0], predict_fn_wrapper, num_features=10)
+lime_feat_importance = {}
+for feat, wt in lime_exp.as_list():
+    base_feat = feat.split(' ')[0]
+    lime_feat_importance[base_feat] = abs(wt)
+
+lime_ranks = pd.Series(lime_feat_importance).rank(ascending=False)
+common_features = shap_ranks.index.intersection(lime_ranks.index)
+
+if len(common_features) >= 2:
+    tau, p_value = kendalltau(shap_ranks.loc[common_features], lime_ranks.loc[common_features])
+    print(f"Kendall Rank Correlation (SHAP vs LIME): Tau = {tau:.4f}, p-value = {p_value:.4f}")
+else:
+    print("Insufficient common features between SHAP and LIME for Kendall Tau correlation.")
+
+common_ranks = pd.DataFrame({
+    "Feature": common_features,
+    "SHAP Rank": shap_ranks.loc[common_features].values,
+    "LIME Rank": lime_ranks.loc[common_features].values
+})
+
+common_ranks.set_index("Feature", inplace=True)
+common_ranks.plot(kind="bar", figsize=(10, 6))
+plt.title("Feature Importance Comparison: SHAP vs LIME")
+plt.ylabel("Rank")
+plt.xlabel("Features")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
